@@ -30,7 +30,7 @@ __host__ static bool InitTensorMap_B(CUtensorMap* tmap, const half* B_ptr, int K
 {
     // Pre-condition checks mandated by TMA descriptor contract (AC-4)
     const int kPtrAlign = 128;
-    if (reinterpret_cast<unsigned long long>(B_ptr) % kPtrAlign != 0) {
+    if (reinterpret_cast<cuuint64_t>(B_ptr) % kPtrAlign != 0) {
         printf("SpMM v4: B pointer not %d-byte aligned, TMA descriptor rejected\n", kPtrAlign);
         return false;
     }
@@ -44,9 +44,9 @@ __host__ static bool InitTensorMap_B(CUtensorMap* tmap, const half* B_ptr, int K
     }
 
     // Global dims: [K_Global, N_Global] in elements
-    unsigned long long kGlobalDim[2] = {(unsigned long long)K_Global, (unsigned long long)N_Global};
+    cuuint64_t kGlobalDim[2] = {(cuuint64_t)K_Global, (cuuint64_t)N_Global};
     // Global strides in BYTES (not elements): stride between consecutive N at fixed K
-    unsigned long long kGlobalStrides[1] = {(unsigned long long)(K_Global * (int)sizeof(half))};
+    cuuint64_t kGlobalStrides[1] = {(cuuint64_t)(K_Global * (int)sizeof(half))};
     // Box/tile dims in elements
     unsigned int       kBoxDim[2]        = {(unsigned int)TILE_K, (unsigned int)TILE_N2};
     unsigned int       kElemStrides[2]   = {1, 1};
