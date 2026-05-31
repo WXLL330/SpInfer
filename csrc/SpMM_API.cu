@@ -13,7 +13,6 @@
 #include "./MatMulUtilities.cuh"
 #include "./Reduction_Kernel.cuh"
 #include "./SpMM_Kernel.cuh"
-#include "./MBarrier_PTX.cuh"
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -62,6 +61,16 @@ __host__ static bool InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K
         printf("SpMM v4: cudaTensorMapEncodeTiled failed (%d)\n", err);
         return false;
     }
+
+    // Host-side self-check: log descriptor contract for verification (AC-4)
+    printf("SpMM v4 TMA descriptor: rank=%u, type=f16, swizzle=tile128b\n", kuintRank);
+    printf("  global dims=[%llu, %llu], global stride=[%llu]\n",
+           kGlobalDim[0], kGlobalDim[1], kGlobalStrides[0]);
+    printf("  box dims=[%u, %u], elem strides=[%u, %u]\n",
+           kBoxDim[0], kBoxDim[1], kElemStrides[0], kElemStrides[1]);
+    printf("  B ptr=%p, smem strides expected=[%d, 1]\n",
+           (const void*)B_ptr, TILE_N2);
+
     return true;
 }
 
@@ -211,9 +220,18 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
                    * (int)sizeof(uint64_t)),
             (TilingConfig::TILE_M + PADDING_SHARED_MEM_FOR_C) * TilingConfig::TILE_N
                 * (int)sizeof(float));
-    cudaFuncSetAttribute(SpMM_Kernel_bitmap_v4<TilingConfig>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         SHMEM_SZ);
+    err = cudaFuncSetAttribute(SpMM_Kernel_bitmap_v4<TilingConfig>,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                SHMEM_SZ);
+    if (err != cudaSuccess) {
+        printf("SpMM v4: cudaFuncSetAttribute failed (%d), falling back to v3\n", err);
+        cudaFree(tensor_map_dev);
+        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
+            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
+            bitmap, max_nnz_intile, B, Reduction_Workspace,
+            M_Global, N_Global, K_Global, Split_K);
+        return;
+    }
 
     // Create TMA tensor map descriptor for B
     TensorMap2D tensor_map_host;
@@ -257,7 +275,10 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
         B, Reduction_Workspace, M_Global, N_Global, K_Global, Split_K, tensor_map_dev);
 
     // Free tensor map descriptor after kernel completes
-    cudaFree(tensor_map_dev);
+    err = cudaFree(tensor_map_dev);
+    if (err != cudaSuccess) {
+        printf("SpMM v4: warning: cudaFree(tensor_map) returned %d\n", err);
+    }
 }
 
 cudaError_t SpMM_SplitK_API_bitmap_v4(cudaStream_t stream,

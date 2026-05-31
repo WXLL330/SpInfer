@@ -311,18 +311,21 @@ __global__ void SpMM_Kernel_bitmap_v4(const half*     A,
                                   has_next || i < (NNZ_ThisTile >> 3));
             }
 
+            // Copy current tile bitmap — always true (not predicated on has_next).
+            // Bitmap is always 64 uint64_t per tile, must be fully populated.
             for (int i = laneId; i < 32; i += WARP_SIZE) {
                 cp_async_bulk<16>(reinterpret_cast<half*>(smem_Bitmap + i * 2),
                                   reinterpret_cast<const half*>(BitmapTileGlobalPTR + i * 2),
-                                  has_next);
+                                  true);
             }
             cp_async_bulk_commit_group();
 
-            cp_async_bulk_tensor_2d(smem_B_write, B_tensor_map, tile_id_k * TILE_K, 0);
+            // TMA load passes Tile_Start_N as the N coordinate so each
+            // blockIdx.x fetches its correct N tile of B (not just tile_n=0).
+            cp_async_bulk_tensor_2d(smem_B_write, B_tensor_map, tile_id_k * TILE_K, Tile_Start_N);
 
             // Wait for all bulk copies (A + bitmap + TMA B) to complete
-            // before signaling consumers. Prevents consumers from reading
-            // partially populated shared memory.
+            // before signaling consumers.
             cp_async_bulk_wait_group<0>();
 
             mbarrier_arrive(mbar_data_ready);

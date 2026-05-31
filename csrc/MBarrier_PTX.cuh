@@ -10,6 +10,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  ***************************************************************************/
+#ifndef MBARRIER_PTX_CUH
+#define MBARRIER_PTX_CUH
+
 // mbarrier PTX wrappers for Blackwell (sm_120) warp specialization.
 // Each mbarrier object occupies 64 bytes in shared memory and must be
 // 64-byte aligned. The mbarrier object is treated as an opaque uint64_t[8]
@@ -66,3 +69,5 @@ __device__ __forceinline__ void mbarrier_inval(uint64_t* mbar_addr)
                  :
                  : "r"(smem_int_ptr));
 }
+
+#endif  // MBARRIER_PTX_CUH
