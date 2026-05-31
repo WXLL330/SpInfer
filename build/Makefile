@@ -49,7 +49,7 @@ HEAD_FILES = SpMM_API.cuh \
 			 ../csrc/Reduction_Kernel.cuh ../csrc/SpMM_Kernel.cuh \
 			 ../csrc/MatMulUtilities.cuh \
 			 ../csrc/MMA_PTX.cuh ../csrc/AsyncCopy_PTX.cuh \
-\t		 ../csrc/MBarrier_PTX.cuh \
+			 ../csrc/MBarrier_PTX.cuh \
 			 ../csrc/TilingConfig.h
 # Target rules
 all: libSpMM_API.so

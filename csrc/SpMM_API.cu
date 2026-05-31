@@ -27,21 +27,42 @@ struct alignas(TENSOR_MAP_ALIGN) TensorMap2D {
     unsigned long long data[TENSOR_MAP_SZ / sizeof(unsigned long long)];
 };
 
-__host__ static void InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K_Global, int N_Global, int TILE_N2)
+__host__ static bool InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K_Global, int N_Global, int TILE_N2)
 {
+    // Pre-condition checks mandated by TMA descriptor contract (AC-4)
+    const int kPtrAlign = 128;
+    if (reinterpret_cast<unsigned long long>(B_ptr) % kPtrAlign != 0) {
+        printf("SpMM v4: B pointer not %d-byte aligned, TMA descriptor rejected\n", kPtrAlign);
+        return false;
+    }
+    if (K_Global % TILE_K != 0) {
+        printf("SpMM v4: K_Global (%d) not divisible by TILE_K (%d)\n", K_Global, TILE_K);
+        return false;
+    }
+    if (N_Global % TILE_N2 != 0) {
+        printf("SpMM v4: N_Global (%d) not divisible by TILE_N2 (%d)\n", N_Global, TILE_N2);
+        return false;
+    }
+
     const unsigned int kuintRank = 2;
     unsigned long long kGlobalDim[2]    = {(unsigned long long)K_Global, (unsigned long long)N_Global};
     unsigned long long kGlobalStrides[1] = {(unsigned long long)K_Global};
     unsigned int       kBoxDim[2]        = {TILE_K, (unsigned int)TILE_N2};
     unsigned int       kElemStrides[2]   = {1, 1};
-    cudaTensorMapEncodeTiled((cudaTensorMap*)tmap,
-                             cudaTensorMapDataTypeFloat16,
-                             kuintRank,
-                             (void*)B_ptr,
-                             kGlobalDim,
-                             kGlobalStrides,
-                             kBoxDim,
-                             kElemStrides);
+
+    cudaError_t err = cudaTensorMapEncodeTiled((cudaTensorMap*)tmap,
+                                                cudaTensorMapDataTypeFloat16,
+                                                kuintRank,
+                                                (void*)B_ptr,
+                                                kGlobalDim,
+                                                kGlobalStrides,
+                                                kBoxDim,
+                                                kElemStrides);
+    if (err != cudaSuccess) {
+        printf("SpMM v4: cudaTensorMapEncodeTiled failed (%d)\n", err);
+        return false;
+    }
+    return true;
 }
 
 template<typename TilingConfig>
@@ -196,7 +217,14 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
 
     // Create TMA tensor map descriptor for B
     TensorMap2D tensor_map_host;
-    InitTensorMap_B(&tensor_map_host, B, K_Global, N_Global, TilingConfig::TILE_N2);
+    if (!InitTensorMap_B(&tensor_map_host, B, K_Global, N_Global, TilingConfig::TILE_N2)) {
+        // Descriptor creation failed — fall back to v3
+        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
+            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
+            bitmap, max_nnz_intile, B, Reduction_Workspace,
+            M_Global, N_Global, K_Global, Split_K);
+        return;
+    }
 
     void*  tensor_map_dev = nullptr;
     cudaError_t err = cudaMalloc(&tensor_map_dev, sizeof(TensorMap2D));

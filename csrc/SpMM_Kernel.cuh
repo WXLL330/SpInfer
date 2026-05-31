@@ -265,16 +265,20 @@ __global__ void SpMM_Kernel_bitmap_v4(const half*     A,
     const int          Tile_Start_Bitmap = y * TilingConfig::TILE_BITMAP_M_V3;
     const int          Tile_Start_N      = x * TilingConfig::TILE_N;
 
+    // ---- One-time mbarrier initialization (warp 0, lane 0 only) ----
+    // Must complete before any warp enters producer/consumer K-loop
+    if (warpId == 0 && laneId == 0) {
+        mbarrier_init(mbar_data_ready, TilingConfig::PRODUCER_WARPS);
+        mbarrier_init(mbar_a_consumed, TilingConfig::CONSUMER_WARPS);
+    }
+    // Block-wide barrier: guarantees consumers never poll uninitialized mbarriers.
+    // This __syncthreads() is outside the K-loop — permitted per AC-5.
+    __syncthreads();
+
     // =========================================================================
     // PRODUCER WARP (warp 0)
     // =========================================================================
     if (warpId < TilingConfig::PRODUCER_WARPS) {
-        // Initialize mbarriers (lane 0 only)
-        if (laneId == 0) {
-            mbarrier_init(mbar_data_ready, TilingConfig::PRODUCER_WARPS);
-            mbarrier_init(mbar_a_consumed, TilingConfig::CONSUMER_WARPS);
-        }
-        __syncwarp();
 
         const uint64_t* BitmapTileGlobalPTR =
             bitmap + Tile_Start_Bitmap * K_Global
