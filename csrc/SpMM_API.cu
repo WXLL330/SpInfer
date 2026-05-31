@@ -21,7 +21,9 @@
 // ---------------------------------------------------------------------------
 // TMA tensor map descriptor for B (128 bytes, 64-byte aligned)
 // Encodes a 2D fp16 tile load: global [K_Global, N_Global] -> shared [TILE_K, TILE_N2]
+// Requires CUDA 12.3+ for cudaTensorMapEncodeTiled.
 // ---------------------------------------------------------------------------
+#if CUDART_VERSION >= 12030
 struct alignas(TENSOR_MAP_ALIGN) TensorMap2D {
     unsigned long long data[TENSOR_MAP_SZ / sizeof(unsigned long long)];
 };
@@ -73,6 +75,7 @@ __host__ static bool InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K
 
     return true;
 }
+#endif  // CUDART_VERSION >= 12030
 
 template<typename TilingConfig>
 static void SpMM_SplitK_Kernel_Ex_bitmap_v3(cudaStream_t stream,
@@ -200,6 +203,9 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
                                             const int          K_Global,
                                             int                Split_K)
 {
+    cudaError_t err;
+    void*       tensor_map_dev = nullptr;
+
     // Runtime guard: max_nnz_intile must fit within shared memory budget.
     // If exceeded, fall back to v3 kernel path.
     const int MAX_NNZ_BUDGET = 2304;
@@ -225,7 +231,6 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
                                 SHMEM_SZ);
     if (err != cudaSuccess) {
         printf("SpMM v4: cudaFuncSetAttribute failed (%d), falling back to v3\n", err);
-        cudaFree(tensor_map_dev);
         SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
             stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
             bitmap, max_nnz_intile, B, Reduction_Workspace,
@@ -233,10 +238,10 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
         return;
     }
 
-    // Create TMA tensor map descriptor for B
+#if CUDART_VERSION >= 12030
+    // TMA tensor map path (CUDA 12.3+ with cudaTensorMapEncodeTiled)
     TensorMap2D tensor_map_host;
     if (!InitTensorMap_B(&tensor_map_host, B, K_Global, N_Global, TilingConfig::TILE_N2)) {
-        // Descriptor creation failed — fall back to v3
         SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
             stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
             bitmap, max_nnz_intile, B, Reduction_Workspace,
@@ -244,8 +249,7 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
         return;
     }
 
-    void*  tensor_map_dev = nullptr;
-    cudaError_t err = cudaMalloc(&tensor_map_dev, sizeof(TensorMap2D));
+    err = cudaMalloc(&tensor_map_dev, sizeof(TensorMap2D));
     if (err != cudaSuccess) {
         printf("SpMM v4: cudaMalloc for tensor map failed (%d), falling back to v3\n", err);
         SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
@@ -258,12 +262,14 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
     if (err != cudaSuccess) {
         printf("SpMM v4: cudaMemcpy for tensor map failed (%d), falling back to v3\n", err);
         cudaFree(tensor_map_dev);
+        tensor_map_dev = nullptr;
         SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
             stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
             bitmap, max_nnz_intile, B, Reduction_Workspace,
             M_Global, N_Global, K_Global, Split_K);
         return;
     }
+#endif  // CUDART_VERSION >= 12030
 
     int  dimN = max(N_Global / TilingConfig::TILE_N, 1);
     int  dimM = M_Global * Split_K / TilingConfig::TILE_M;
@@ -275,9 +281,11 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
         B, Reduction_Workspace, M_Global, N_Global, K_Global, Split_K, tensor_map_dev);
 
     // Free tensor map descriptor after kernel completes
-    err = cudaFree(tensor_map_dev);
-    if (err != cudaSuccess) {
-        printf("SpMM v4: warning: cudaFree(tensor_map) returned %d\n", err);
+    if (tensor_map_dev != nullptr) {
+        err = cudaFree(tensor_map_dev);
+        if (err != cudaSuccess) {
+            printf("SpMM v4: warning: cudaFree(tensor_map) returned %d\n", err);
+        }
     }
 }
 
