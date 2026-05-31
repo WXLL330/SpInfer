@@ -307,14 +307,19 @@ __global__ void SpMM_Kernel_bitmap_v4(const half*     A,
                                   has_next || i < (NNZ_ThisTile >> 3));
             }
 
-            for (int i = laneId; i < 64; i += WARP_SIZE) {
-                cp_async_bulk<16>(reinterpret_cast<half*>(smem_Bitmap + i),
-                                  reinterpret_cast<const half*>(BitmapTileGlobalPTR + i),
+            for (int i = laneId; i < 32; i += WARP_SIZE) {
+                cp_async_bulk<16>(reinterpret_cast<half*>(smem_Bitmap + i * 2),
+                                  reinterpret_cast<const half*>(BitmapTileGlobalPTR + i * 2),
                                   has_next);
             }
             cp_async_bulk_commit_group();
 
             cp_async_bulk_tensor_2d(smem_B_write, B_tensor_map, tile_id_k * TILE_K, 0);
+
+            // Wait for all bulk copies (A + bitmap + TMA B) to complete
+            // before signaling consumers. Prevents consumers from reading
+            // partially populated shared memory.
+            cp_async_bulk_wait_group<0>();
 
             mbarrier_arrive(mbar_data_ready);
 

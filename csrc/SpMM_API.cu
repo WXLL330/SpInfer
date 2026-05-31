@@ -170,11 +170,22 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
                                             const int          K_Global,
                                             int                Split_K)
 {
+    // Runtime guard: max_nnz_intile must fit within shared memory budget.
+    // If exceeded, fall back to v3 kernel path.
+    const int MAX_NNZ_BUDGET = 2304;
+    if (*max_nnz_intile > MAX_NNZ_BUDGET) {
+        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
+            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
+            bitmap, max_nnz_intile, B, Reduction_Workspace,
+            M_Global, N_Global, K_Global, Split_K);
+        return;
+    }
+
     // Shared memory budget: 2 mbarriers + A + 2×B double-buffer + bitmap
     static int SHMEM_SZ =
         max((2 * MBARRIER_SZ
              + (int)(TilingConfig::TILE_N * TILE_K) * (int)sizeof(half) * 2
-             + 2304 * (int)sizeof(half)
+             + MAX_NNZ_BUDGET * (int)sizeof(half)
              + (int)(TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3)
                    * (int)sizeof(uint64_t)),
             (TilingConfig::TILE_M + PADDING_SHARED_MEM_FOR_C) * TilingConfig::TILE_N
@@ -187,9 +198,26 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
     TensorMap2D tensor_map_host;
     InitTensorMap_B(&tensor_map_host, B, K_Global, N_Global, TilingConfig::TILE_N2);
 
-    void* tensor_map_dev = nullptr;
-    cudaMalloc(&tensor_map_dev, sizeof(TensorMap2D));
-    cudaMemcpy(tensor_map_dev, &tensor_map_host, sizeof(TensorMap2D), cudaMemcpyHostToDevice);
+    void*  tensor_map_dev = nullptr;
+    cudaError_t err = cudaMalloc(&tensor_map_dev, sizeof(TensorMap2D));
+    if (err != cudaSuccess) {
+        printf("SpMM v4: cudaMalloc for tensor map failed (%d), falling back to v3\n", err);
+        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
+            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
+            bitmap, max_nnz_intile, B, Reduction_Workspace,
+            M_Global, N_Global, K_Global, Split_K);
+        return;
+    }
+    err = cudaMemcpy(tensor_map_dev, &tensor_map_host, sizeof(TensorMap2D), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        printf("SpMM v4: cudaMemcpy for tensor map failed (%d), falling back to v3\n", err);
+        cudaFree(tensor_map_dev);
+        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
+            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
+            bitmap, max_nnz_intile, B, Reduction_Workspace,
+            M_Global, N_Global, K_Global, Split_K);
+        return;
+    }
 
     int  dimN = max(N_Global / TilingConfig::TILE_N, 1);
     int  dimM = M_Global * Split_K / TilingConfig::TILE_M;
@@ -199,6 +227,9 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
     SpMM_Kernel_bitmap_v4<TilingConfig><<<GridDim, BlockDim, SHMEM_SZ, stream>>>(
         A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap, max_nnz_intile,
         B, Reduction_Workspace, M_Global, N_Global, K_Global, Split_K, tensor_map_dev);
+
+    // Free tensor map descriptor after kernel completes
+    cudaFree(tensor_map_dev);
 }
 
 cudaError_t SpMM_SplitK_API_bitmap_v4(cudaStream_t stream,
@@ -249,15 +280,8 @@ cudaError_t SpMM_SplitK_API_bitmap_v4(cudaStream_t stream,
                 max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
             break;
         default:
-            if (N_Global % 128 == 0)
-                SpMM_SplitK_Kernel_Ex_bitmap_v4<TilingConfigBitmapV4<4, 1, 4>>(
-                    stream, A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap,
-                    max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
-            else {
-                printf("SpMM v4 Error: Unsupported N dimension %d!\n", N_Global);
-                return cudaErrorUnknown;
-            }
-            break;
+            printf("SpMM v4 Error: Unsupported N dimension %d! Supported: 8,16,32,64,128\n", N_Global);
+            return cudaErrorUnknown;
     }
 
     cudaError_t Error = cudaGetLastError();
