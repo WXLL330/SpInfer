@@ -21,14 +21,12 @@
 // ---------------------------------------------------------------------------
 // TMA tensor map descriptor for B (128 bytes, 64-byte aligned)
 // Encodes a 2D fp16 tile load: global [K_Global, N_Global] -> shared [TILE_K, TILE_N2]
-// Requires CUDA 12.3+ for cudaTensorMapEncodeTiled.
+// Uses CUDA Driver API cuTensorMapEncodeTiled (requires <cuda.h>, CUDA 12.0+).
 // ---------------------------------------------------------------------------
-#if CUDART_VERSION >= 12030
-struct alignas(TENSOR_MAP_ALIGN) TensorMap2D {
-    unsigned long long data[TENSOR_MAP_SZ / sizeof(unsigned long long)];
-};
+#if CUDART_VERSION >= 12000
+#include <cuda.h>
 
-__host__ static bool InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K_Global, int N_Global, int TILE_N2)
+__host__ static bool InitTensorMap_B(CUtensorMap* tmap, const half* B_ptr, int K_Global, int N_Global, int TILE_N2)
 {
     // Pre-condition checks mandated by TMA descriptor contract (AC-4)
     const int kPtrAlign = 128;
@@ -45,28 +43,37 @@ __host__ static bool InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K
         return false;
     }
 
-    const unsigned int kuintRank = 2;
-    unsigned long long kGlobalDim[2]    = {(unsigned long long)K_Global, (unsigned long long)N_Global};
-    unsigned long long kGlobalStrides[1] = {(unsigned long long)K_Global};
-    unsigned int       kBoxDim[2]        = {TILE_K, (unsigned int)TILE_N2};
+    // Global dims: [K_Global, N_Global] in elements
+    unsigned long long kGlobalDim[2] = {(unsigned long long)K_Global, (unsigned long long)N_Global};
+    // Global strides in BYTES (not elements): stride between consecutive N at fixed K
+    unsigned long long kGlobalStrides[1] = {(unsigned long long)(K_Global * (int)sizeof(half))};
+    // Box/tile dims in elements
+    unsigned int       kBoxDim[2]        = {(unsigned int)TILE_K, (unsigned int)TILE_N2};
     unsigned int       kElemStrides[2]   = {1, 1};
 
-    cudaError_t err = cudaTensorMapEncodeTiled((cudaTensorMap*)tmap,
-                                                cudaTensorMapDataTypeFloat16,
-                                                kuintRank,
-                                                (void*)B_ptr,
-                                                kGlobalDim,
-                                                kGlobalStrides,
-                                                kBoxDim,
-                                                kElemStrides);
-    if (err != cudaSuccess) {
-        printf("SpMM v4: cudaTensorMapEncodeTiled failed (%d)\n", err);
+    CUresult result = cuTensorMapEncodeTiled(
+        tmap,
+        CU_TENSOR_MAP_DATA_TYPE_FLOAT16,  // fp16 element type
+        2,                                  // rank = 2
+        (void*)B_ptr,                      // global base address
+        kGlobalDim,                        // tensor dimensions [K, N]
+        kGlobalStrides,                    // byte strides (excludes innermost dim)
+        kBoxDim,                           // tile box dims [TILE_K, TILE_N2]
+        kElemStrides,                      // element strides within box
+        CU_TENSOR_MAP_INTERLEAVE_NONE,     // no interleave
+        CU_TENSOR_MAP_SWIZZLE_128B,        // 128-byte swizzle (required for Blackwell tcgen05)
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,   // no L2 promotion
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE  // no OOB fill
+    );
+
+    if (result != CUDA_SUCCESS) {
+        printf("SpMM v4: cuTensorMapEncodeTiled failed (CUresult=%d)\n", result);
         return false;
     }
 
     // Host-side self-check: log descriptor contract for verification (AC-4)
-    printf("SpMM v4 TMA descriptor: rank=%u, type=f16, swizzle=tile128b\n", kuintRank);
-    printf("  global dims=[%llu, %llu], global stride=[%llu]\n",
+    printf("SpMM v4 TMA descriptor: rank=2, type=f16, swizzle=128B\n");
+    printf("  global dims=[%llu, %llu], global stride=[%llu] bytes\n",
            kGlobalDim[0], kGlobalDim[1], kGlobalStrides[0]);
     printf("  box dims=[%u, %u], elem strides=[%u, %u]\n",
            kBoxDim[0], kBoxDim[1], kElemStrides[0], kElemStrides[1]);
@@ -75,7 +82,7 @@ __host__ static bool InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K
 
     return true;
 }
-#endif  // CUDART_VERSION >= 12030
+#endif  // CUDART_VERSION >= 12000
 
 template<typename TilingConfig>
 static void SpMM_SplitK_Kernel_Ex_bitmap_v3(cudaStream_t stream,
@@ -238,9 +245,9 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
         return;
     }
 
-#if CUDART_VERSION >= 12030
-    // TMA tensor map path (CUDA 12.3+ with cudaTensorMapEncodeTiled)
-    TensorMap2D tensor_map_host;
+#if CUDART_VERSION >= 12000
+    // TMA tensor map path (CUDA 12.0+ with cuTensorMapEncodeTiled)
+    CUtensorMap tensor_map_host;
     if (!InitTensorMap_B(&tensor_map_host, B, K_Global, N_Global, TilingConfig::TILE_N2)) {
         SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
             stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
@@ -249,7 +256,7 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
         return;
     }
 
-    err = cudaMalloc(&tensor_map_dev, sizeof(TensorMap2D));
+    err = cudaMalloc(&tensor_map_dev, sizeof(CUtensorMap));
     if (err != cudaSuccess) {
         printf("SpMM v4: cudaMalloc for tensor map failed (%d), falling back to v3\n", err);
         SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
@@ -258,7 +265,7 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
             M_Global, N_Global, K_Global, Split_K);
         return;
     }
-    err = cudaMemcpy(tensor_map_dev, &tensor_map_host, sizeof(TensorMap2D), cudaMemcpyHostToDevice);
+    err = cudaMemcpy(tensor_map_dev, &tensor_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         printf("SpMM v4: cudaMemcpy for tensor map failed (%d), falling back to v3\n", err);
         cudaFree(tensor_map_dev);
@@ -269,7 +276,7 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
             M_Global, N_Global, K_Global, Split_K);
         return;
     }
-#endif  // CUDART_VERSION >= 12030
+#endif  // CUDART_VERSION >= 12000
 
     int  dimN = max(N_Global / TilingConfig::TILE_N, 1);
     int  dimM = M_Global * Split_K / TilingConfig::TILE_M;
