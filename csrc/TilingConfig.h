@@ -122,6 +122,41 @@ struct TilingConfigBitmapV3 {
 };
 
 
+template<int BLOCK_ROW_WARPS_, int BLOCK_COL_WARPS_, int WARP_COL_TENSORS_, int N8_ = 0>
+struct TilingConfigBitmapV4 {
+    // Producer-consumer warp split for warp specialization
+    static constexpr int PRODUCER_WARPS    = 1;
+    static constexpr int CONSUMER_ROW_WARPS = BLOCK_ROW_WARPS_;
+    static constexpr int CONSUMER_COL_WARPS = BLOCK_COL_WARPS_;
+    static constexpr int CONSUMER_WARPS    = CONSUMER_ROW_WARPS * CONSUMER_COL_WARPS;
+
+    // Tiling dimensions (based on consumer compute geometry, identical to V3)
+    static constexpr int BLOCK_ROW_WARPS    = BLOCK_ROW_WARPS_;
+    static constexpr int BLOCK_COL_WARPS    = BLOCK_COL_WARPS_;
+    static constexpr int WARP_COL_TENSORS   = WARP_COL_TENSORS_;
+    static constexpr int TILE_M             = MMA_M * (WARP_ROW_TENSORS_BITMAP_V3 * BLOCK_ROW_WARPS);
+    static constexpr int TILE_BITMAP_M_V3   = 1;
+    static constexpr int TILE_BITMAP_K_V3   = 64;
+    static constexpr int TILE_N             = MMA_N * (WARP_COL_TENSORS * BLOCK_COL_WARPS);
+
+    // Block geometry: consumer compute warps + 1 producer warp
+    static constexpr int BLOCK_WARPS   = CONSUMER_WARPS + PRODUCER_WARPS;
+    static constexpr int BLOCK_THREADS = BLOCK_WARPS * WARP_SIZE;
+
+    // TMA load size for a single B tile (bytes)
+    static constexpr int TMA_LOAD_SIZE_B = TILE_K * TILE_N * sizeof(half);
+
+    // N8 special case support
+    static constexpr int N8      = N8_;
+    static constexpr int TILE_N2 = N8 ? 8 : TILE_N;
+};
+
+// Tensor map descriptor size and alignment for TMA
+#define TENSOR_MAP_SZ    128
+#define TENSOR_MAP_ALIGN 64
+#define MBARRIER_SZ       64
+#define MBARRIER_ALIGN    64
+
 template<int NUM_REG_FOR_SPARSE_KERNEL_ = 64>
 struct SparseKernelConfig {
     static constexpr int NUM_REG_FOR_SPARSE_KERNEL    = NUM_REG_FOR_SPARSE_KERNEL_;

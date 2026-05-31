@@ -13,10 +13,36 @@
 #include "./MatMulUtilities.cuh"
 #include "./Reduction_Kernel.cuh"
 #include "./SpMM_Kernel.cuh"
+#include "./MBarrier_PTX.cuh"
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// TMA tensor map descriptor for B (128 bytes, 64-byte aligned)
+// Encodes a 2D fp16 tile load: global [K_Global, N_Global] -> shared [TILE_K, TILE_N2]
+// ---------------------------------------------------------------------------
+struct alignas(TENSOR_MAP_ALIGN) TensorMap2D {
+    unsigned long long data[TENSOR_MAP_SZ / sizeof(unsigned long long)];
+};
+
+__host__ static void InitTensorMap_B(TensorMap2D* tmap, const half* B_ptr, int K_Global, int N_Global, int TILE_N2)
+{
+    const unsigned int kuintRank = 2;
+    unsigned long long kGlobalDim[2]    = {(unsigned long long)K_Global, (unsigned long long)N_Global};
+    unsigned long long kGlobalStrides[1] = {(unsigned long long)K_Global};
+    unsigned int       kBoxDim[2]        = {TILE_K, (unsigned int)TILE_N2};
+    unsigned int       kElemStrides[2]   = {1, 1};
+    cudaTensorMapEncodeTiled((cudaTensorMap*)tmap,
+                             cudaTensorMapDataTypeFloat16,
+                             kuintRank,
+                             (void*)B_ptr,
+                             kGlobalDim,
+                             kGlobalStrides,
+                             kBoxDim,
+                             kElemStrides);
+}
 
 template<typename TilingConfig>
 static void SpMM_SplitK_Kernel_Ex_bitmap_v3(cudaStream_t stream,
@@ -119,6 +145,128 @@ cudaError_t SpMM_SplitK_API_bitmap_v3(cudaStream_t stream,
     if (Split_K == 1)
         return Error;
     
+    dim3 GridDim((M_Global * N_Global) / 256, 1, 1);
+    dim3 BlockDim(WARP_SIZE, 1, 1);
+    SplitK_Reduction<<<GridDim, BlockDim, 0, stream>>>(C, Reduction_Workspace, M_Global, N_Global, Split_K);
+    return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// v4 kernel launcher and API — stub forwards to v3 initially;
+// will be replaced with TMA + warp specialization in t7-t12.
+// ---------------------------------------------------------------------------
+template <typename TilingConfig>
+static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
+                                            const half*        A,
+                                            const half*        Compressed_A,
+                                            const int*         TileOffsets,
+                                            const int*         TileOffsets_Median,
+                                            const uint64_t*    bitmap,
+                                            const int*         max_nnz_intile,
+                                            const half*        B,
+                                            half*              Reduction_Workspace,
+                                            const int          M_Global,
+                                            const int          N_Global,
+                                            const int          K_Global,
+                                            int                Split_K)
+{
+    // Shared memory budget: 2 mbarriers + A + 2×B double-buffer + bitmap
+    static int SHMEM_SZ =
+        max((2 * MBARRIER_SZ
+             + (int)(TilingConfig::TILE_N * TILE_K) * (int)sizeof(half) * 2
+             + 2304 * (int)sizeof(half)
+             + (int)(TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3)
+                   * (int)sizeof(uint64_t)),
+            (TilingConfig::TILE_M + PADDING_SHARED_MEM_FOR_C) * TilingConfig::TILE_N
+                * (int)sizeof(float));
+    cudaFuncSetAttribute(SpMM_Kernel_bitmap_v4<TilingConfig>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         SHMEM_SZ);
+
+    // Create TMA tensor map descriptor for B
+    TensorMap2D tensor_map_host;
+    InitTensorMap_B(&tensor_map_host, B, K_Global, N_Global, TilingConfig::TILE_N2);
+
+    void* tensor_map_dev = nullptr;
+    cudaMalloc(&tensor_map_dev, sizeof(TensorMap2D));
+    cudaMemcpy(tensor_map_dev, &tensor_map_host, sizeof(TensorMap2D), cudaMemcpyHostToDevice);
+
+    int  dimN = max(N_Global / TilingConfig::TILE_N, 1);
+    int  dimM = M_Global * Split_K / TilingConfig::TILE_M;
+    dim3 GridDim(dimN, dimM, 1);
+    dim3 BlockDim(WARP_SIZE * TilingConfig::BLOCK_WARPS, 1, 1);
+
+    SpMM_Kernel_bitmap_v4<TilingConfig><<<GridDim, BlockDim, SHMEM_SZ, stream>>>(
+        A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap, max_nnz_intile,
+        B, Reduction_Workspace, M_Global, N_Global, K_Global, Split_K, tensor_map_dev);
+}
+
+cudaError_t SpMM_SplitK_API_bitmap_v4(cudaStream_t stream,
+                                      const half*        A,
+                                      const half*        Compressed_A,
+                                      const int*         TileOffsets,
+                                      const int*         TileOffsets_Median,
+                                      const uint64_t*    bitmap,
+                                      const int*         max_nnz_intile,
+                                      const half*        B,
+                                      half*              C,
+                                      const int          M_Global,
+                                      const int          N_Global,
+                                      const int          K_Global,
+                                      half*              Reduction_Workspace,
+                                      int                Split_K)
+{
+    half* SpMM_SplitK_OutputPTR;
+    if (Split_K == 1)
+        SpMM_SplitK_OutputPTR = C;
+    else
+        SpMM_SplitK_OutputPTR = Reduction_Workspace;
+
+    switch (N_Global) {
+        case 8:
+            SpMM_SplitK_Kernel_Ex_bitmap_v4<TilingConfigBitmapV4<4, 1, 1, 1>>(
+                stream, A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap,
+                max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
+            break;
+        case 16:
+            SpMM_SplitK_Kernel_Ex_bitmap_v4<TilingConfigBitmapV4<4, 1, 1>>(
+                stream, A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap,
+                max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
+            break;
+        case 32:
+            SpMM_SplitK_Kernel_Ex_bitmap_v4<TilingConfigBitmapV4<4, 1, 2>>(
+                stream, A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap,
+                max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
+            break;
+        case 64:
+            SpMM_SplitK_Kernel_Ex_bitmap_v4<TilingConfigBitmapV4<4, 1, 4>>(
+                stream, A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap,
+                max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
+            break;
+        case 128:
+            SpMM_SplitK_Kernel_Ex_bitmap_v4<TilingConfigBitmapV4<4, 1, 4>>(
+                stream, A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap,
+                max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
+            break;
+        default:
+            if (N_Global % 128 == 0)
+                SpMM_SplitK_Kernel_Ex_bitmap_v4<TilingConfigBitmapV4<4, 1, 4>>(
+                    stream, A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap,
+                    max_nnz_intile, B, SpMM_SplitK_OutputPTR, M_Global, N_Global, K_Global, Split_K);
+            else {
+                printf("SpMM v4 Error: Unsupported N dimension %d!\n", N_Global);
+                return cudaErrorUnknown;
+            }
+            break;
+    }
+
+    cudaError_t Error = cudaGetLastError();
+    if (Error != cudaSuccess)
+        return Error;
+
+    if (Split_K == 1)
+        return Error;
+
     dim3 GridDim((M_Global * N_Global) / 256, 1, 1);
     dim3 BlockDim(WARP_SIZE, 1, 1);
     SplitK_Reduction<<<GridDim, BlockDim, 0, stream>>>(C, Reduction_Workspace, M_Global, N_Global, Split_K);

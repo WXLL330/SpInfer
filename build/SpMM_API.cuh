@@ -29,6 +29,21 @@ cudaError_t SpMM_SplitK_API_bitmap_v3(cudaStream_t stream,
                                     const int    K_Global,
                                     half*        Reduction_Workspace,
                                     int          Split_K);
+
+cudaError_t SpMM_SplitK_API_bitmap_v4(cudaStream_t stream,
+                                    const half*  A,
+                                    const half*  Compressed_A,
+                                    const int*   TileOffsets,
+                                    const int* TileOffsets_Median,
+                                    const uint64_t* bitmap,
+                                    const int* max_nnz_intile,
+                                    const half*  B,
+                                    half*        C,
+                                    const int    M_Global,
+                                    const int    N_Global,
+                                    const int    K_Global,
+                                    half*        Reduction_Workspace,
+                                    int          Split_K);
 // Our sparsity_llm
 __host__ int InitSparseMatrixA_bitmap(
                                         half* A_h,
