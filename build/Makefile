@@ -35,7 +35,7 @@ LIBRARIES := -lcublas -lcusparse
 ################################################################################
 
 # Gencode arguments
-SMS ?= 89
+SMS ?= 89 120
 # Generate SASS code for each SM architecture listed in $(SMS)
 $(foreach sm,$(SMS),$(eval GENCODE_FLAGS += -gencode arch=compute_$(sm),code=sm_$(sm)))
 
@@ -49,6 +49,7 @@ HEAD_FILES = SpMM_API.cuh \
 			 ../csrc/Reduction_Kernel.cuh ../csrc/SpMM_Kernel.cuh \
 			 ../csrc/MatMulUtilities.cuh \
 			 ../csrc/MMA_PTX.cuh ../csrc/AsyncCopy_PTX.cuh \
+			 ../csrc/AsyncCopyBulk_PTX.cuh \
 			 ../csrc/MBarrier_PTX.cuh \
 			 ../csrc/TilingConfig.h
 # Target rules

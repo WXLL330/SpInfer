@@ -11,6 +11,7 @@
  * limitations under the License.
  ***************************************************************************/
 #include "MatMulUtilities.cuh"
+#include "AsyncCopyBulk_PTX.cuh"
 #include "MBarrier_PTX.cuh"
 #include <vector>
 #include <inttypes.h>
@@ -291,12 +292,15 @@ __global__ void SpMM_Kernel_bitmap_v4(const half*     A,
         int StartIndex_SparseTiles = TileOffsets_ThisBlock[0];
         int NNZ_ThisTile           = TileOffsets_ThisBlock[1] - TileOffsets_ThisBlock[0];
 
+        int prod_parity = 0;  // parity for mbar_a_consumed (producer side)
+
         for (int tile_id_k = 0; tile_id_k < NumIter; tile_id_k++) {
             if (tile_id_k > 0) {
-                int phase = (tile_id_k - 1) & 1;
-                while (mbarrier_try_wait(mbar_a_consumed, phase) == 0) {
+                // Wait for consumers to finish consuming previous A/bitmap
+                while (mbarrier_try_wait_parity(mbar_a_consumed, prod_parity) == 0) {
                     __nanosleep(1);
                 }
+                prod_parity ^= 1;  // toggle for next cycle
             }
 
             int buf_idx = tile_id_k & 1;
@@ -364,11 +368,13 @@ __global__ void SpMM_Kernel_bitmap_v4(const half*     A,
             for (int j = 0; j < REG_PER_C_TENSOR_16_16; j++)
                 c[i][j] = 0.0f;
 
+        int cons_parity = 0;  // parity tracking for mbar_data_ready (consumer side)
+
         for (int tile_id_k = 0; tile_id_k < NumIter; tile_id_k++) {
-            int phase = tile_id_k & 1;
-            while (mbarrier_try_wait(mbar_data_ready, phase) == 0) {
+            while (mbarrier_try_wait_parity(mbar_data_ready, cons_parity) == 0) {
                 __nanosleep(1);
             }
+            cons_parity ^= 1;  // toggle for next cycle
 
             SpMM_LoadFragAwithBitmapFromShem(a, smem_A + TileOffsets_ThisWarp[tile_id_k * 4],
                                              smem_BitmapWarp, tile_id_k < NumIter);
