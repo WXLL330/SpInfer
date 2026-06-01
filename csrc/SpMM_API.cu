@@ -100,8 +100,11 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v3(cudaStream_t stream,
                                   const int    K_Global,
                                   int          Split_K)
 {
+    int max_nnz_intile_host = 2304;    // 2304
+    cudaMemcpy(&max_nnz_intile_host, max_nnz_intile, sizeof(int), cudaMemcpyDeviceToHost);
+    // printf("SpMM v3: max_nnz_intile = %d\n", max_nnz_intile_host);
     // 13b: 2304
-    static int SHMEM_SZ = max((TilingConfig::TILE_N * TILE_K) * sizeof(half) * 2 + 2304 * sizeof(half) + (TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3) * sizeof(uint64_t),
+    int SHMEM_SZ = max((TilingConfig::TILE_N * TILE_K) * sizeof(half) * 2 + max_nnz_intile_host * sizeof(half) + (TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3) * sizeof(uint64_t),
                               (TilingConfig::TILE_M + PADDING_SHARED_MEM_FOR_C) * TilingConfig::TILE_N * sizeof(float));
     cudaFuncSetAttribute(
         SpMM_Kernel_bitmap_v3<TilingConfig>, cudaFuncAttributeMaxDynamicSharedMemorySize, SHMEM_SZ);
@@ -217,13 +220,14 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
 
     // Runtime guard: max_nnz_intile must fit within shared memory budget.
     // If exceeded, fall back to v3 kernel path.
-    const int MAX_NNZ_BUDGET = 2304;
+    int max_nnz_intile_host = 0;
+    cudaMemcpy(&max_nnz_intile_host, max_nnz_intile, sizeof(int), cudaMemcpyDeviceToHost);
 
     // Shared memory budget: 2 mbarriers + A + 2×B double-buffer + bitmap
-    static int SHMEM_SZ =
+    int SHMEM_SZ =
         max((2 * MBARRIER_SZ
              + (int)(TilingConfig::TILE_N * TILE_K) * (int)sizeof(half) * 2
-             + MAX_NNZ_BUDGET * (int)sizeof(half)
+             + max_nnz_intile_host * (int)sizeof(half)
              + (int)(TilingConfig::TILE_BITMAP_M_V3 * TilingConfig::TILE_BITMAP_K_V3)
                    * (int)sizeof(uint64_t)),
             (TilingConfig::TILE_M + PADDING_SHARED_MEM_FOR_C) * TilingConfig::TILE_N
