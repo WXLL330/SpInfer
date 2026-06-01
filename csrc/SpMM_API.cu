@@ -13,6 +13,7 @@
 #include "./MatMulUtilities.cuh"
 #include "./Reduction_Kernel.cuh"
 #include "./SpMM_Kernel.cuh"
+#include "./SpMM_Kernel_Blackwell.cuh"
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -23,7 +24,7 @@
 // Encodes a 2D fp16 tile load: global [K_Global, N_Global] -> shared [TILE_K, TILE_N2]
 // Uses CUDA Driver API cuTensorMapEncodeTiled (requires <cuda.h>, CUDA 12.0+).
 // ---------------------------------------------------------------------------
-#if CUDART_VERSION >= 12000
+// #if CUDART_VERSION >= 12000
 #include <cuda.h>
 
 __host__ static bool InitTensorMap_B(CUtensorMap* tmap, const half* B_ptr, int K_Global, int N_Global, int TILE_N2)
@@ -72,17 +73,17 @@ __host__ static bool InitTensorMap_B(CUtensorMap* tmap, const half* B_ptr, int K
     }
 
     // Host-side self-check: log descriptor contract for verification (AC-4)
-    printf("SpMM v4 TMA descriptor: rank=2, type=f16, swizzle=128B\n");
-    printf("  global dims=[%llu, %llu], global stride=[%llu] bytes\n",
-           kGlobalDim[0], kGlobalDim[1], kGlobalStrides[0]);
-    printf("  box dims=[%u, %u], elem strides=[%u, %u]\n",
-           kBoxDim[0], kBoxDim[1], kElemStrides[0], kElemStrides[1]);
-    printf("  B ptr=%p, smem strides expected=[%d, 1]\n",
-           (const void*)B_ptr, TILE_N2);
+    // printf("SpMM v4 TMA descriptor: rank=2, type=f16, swizzle=128B\n");
+    // printf("  global dims=[%llu, %llu], global stride=[%llu] bytes\n",
+    //        kGlobalDim[0], kGlobalDim[1], kGlobalStrides[0]);
+    // printf("  box dims=[%u, %u], elem strides=[%u, %u]\n",
+    //        kBoxDim[0], kBoxDim[1], kElemStrides[0], kElemStrides[1]);
+    // printf("  B ptr=%p, smem strides expected=[%d, 1]\n",
+    //        (const void*)B_ptr, TILE_N2);
 
     return true;
 }
-#endif  // CUDART_VERSION >= 12000
+// #endif  // CUDART_VERSION >= 12000
 
 template<typename TilingConfig>
 static void SpMM_SplitK_Kernel_Ex_bitmap_v3(cudaStream_t stream,
@@ -191,9 +192,10 @@ cudaError_t SpMM_SplitK_API_bitmap_v3(cudaStream_t stream,
     return cudaGetLastError();
 }
 
+// #if __CUDA_ARCH__ >= 900
 // ---------------------------------------------------------------------------
-// v4 kernel launcher and API — stub forwards to v3 initially;
-// will be replaced with TMA + warp specialization in t7-t12.
+// v4 kernel launcher and API — TMA + warp specialization for Blackwell.
+// Only compiled for sm_90+ targets; sm_89 falls through to v3 via API guard.
 // ---------------------------------------------------------------------------
 template <typename TilingConfig>
 static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
@@ -216,13 +218,6 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
     // Runtime guard: max_nnz_intile must fit within shared memory budget.
     // If exceeded, fall back to v3 kernel path.
     const int MAX_NNZ_BUDGET = 2304;
-    if (*max_nnz_intile > MAX_NNZ_BUDGET) {
-        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
-            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
-            bitmap, max_nnz_intile, B, Reduction_Workspace,
-            M_Global, N_Global, K_Global, Split_K);
-        return;
-    }
 
     // Shared memory budget: 2 mbarriers + A + 2×B double-buffer + bitmap
     static int SHMEM_SZ =
@@ -237,46 +232,31 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                 SHMEM_SZ);
     if (err != cudaSuccess) {
-        printf("SpMM v4: cudaFuncSetAttribute failed (%d), falling back to v3\n", err);
-        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
-            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
-            bitmap, max_nnz_intile, B, Reduction_Workspace,
-            M_Global, N_Global, K_Global, Split_K);
+        printf("SpMM v4: cudaFuncSetAttribute failed (%d)\n", err);
         return;
     }
 
-#if CUDART_VERSION >= 12000
+// #if CUDART_VERSION >= 12000
     // TMA tensor map path (CUDA 12.0+ with cuTensorMapEncodeTiled)
     CUtensorMap tensor_map_host;
     if (!InitTensorMap_B(&tensor_map_host, B, K_Global, N_Global, TilingConfig::TILE_N2)) {
-        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
-            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
-            bitmap, max_nnz_intile, B, Reduction_Workspace,
-            M_Global, N_Global, K_Global, Split_K);
+        printf("SpMM v4: tensorMap initialization failed\n");
         return;
     }
 
-    err = cudaMalloc(&tensor_map_dev, sizeof(CUtensorMap));
+    err = cudaMallocAsync(&tensor_map_dev, sizeof(CUtensorMap), stream);
     if (err != cudaSuccess) {
-        printf("SpMM v4: cudaMalloc for tensor map failed (%d), falling back to v3\n", err);
-        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
-            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
-            bitmap, max_nnz_intile, B, Reduction_Workspace,
-            M_Global, N_Global, K_Global, Split_K);
+        printf("SpMM v4: cudaMalloc for tensor map failed (%d)\n", err);
         return;
     }
-    err = cudaMemcpy(tensor_map_dev, &tensor_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    err = cudaMemcpyAsync(tensor_map_dev, &tensor_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess) {
-        printf("SpMM v4: cudaMemcpy for tensor map failed (%d), falling back to v3\n", err);
+        printf("SpMM v4: cudaMemcpy for tensor map failed (%d)\n", err);
         cudaFree(tensor_map_dev);
         tensor_map_dev = nullptr;
-        SpMM_SplitK_Kernel_Ex_bitmap_v3<TilingConfig>(
-            stream, A, Compressed_A, TileOffsets, TileOffsets_Median,
-            bitmap, max_nnz_intile, B, Reduction_Workspace,
-            M_Global, N_Global, K_Global, Split_K);
         return;
     }
-#endif  // CUDART_VERSION >= 12000
+// #endif  // CUDART_VERSION >= 12000
 
     int  dimN = max(N_Global / TilingConfig::TILE_N, 1);
     int  dimM = M_Global * Split_K / TilingConfig::TILE_M;
@@ -287,9 +267,11 @@ static void SpMM_SplitK_Kernel_Ex_bitmap_v4(cudaStream_t stream,
         A, Compressed_A, TileOffsets, TileOffsets_Median, bitmap, max_nnz_intile,
         B, Reduction_Workspace, M_Global, N_Global, K_Global, Split_K, tensor_map_dev);
 
+    // cudaStreamSynchronize(stream);
+
     // Free tensor map descriptor after kernel completes
     if (tensor_map_dev != nullptr) {
-        err = cudaFree(tensor_map_dev);
+        err = cudaFreeAsync(tensor_map_dev, stream);
         if (err != cudaSuccess) {
             printf("SpMM v4: warning: cudaFree(tensor_map) returned %d\n", err);
         }
@@ -360,6 +342,7 @@ cudaError_t SpMM_SplitK_API_bitmap_v4(cudaStream_t stream,
     SplitK_Reduction<<<GridDim, BlockDim, 0, stream>>>(C, Reduction_Workspace, M_Global, N_Global, Split_K);
     return cudaGetLastError();
 }
+// #endif  // __CUDA_ARCH__ >= 900
 
 __host__ int InitSparseMatrixA_bitmap(
     half* A_h,

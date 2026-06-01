@@ -20,43 +20,54 @@
 
 #include "TilingConfig.h"
 
-#if __CUDA_ARCH__ >= 900
+// #if __CUDA_ARCH__ >= 900
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
 
 // ---------------------------------------------------------------------------
 // cp.async.bulk — non-tensor bulk async copy (global → shared)
-// Replaces cp.async for A (sparse) and bitmap loads on Hopper+.
+// Uses mbarrier::complete_tx::bytes completion mechanism (required by sm_120).
+// Producer must call mbarrier_arrive_expect_tx before issuing these copies,
+// then the hardware auto-completes the mbarrier when all bytes arrive.
 // ---------------------------------------------------------------------------
 
 template <int SizeInBytes>
-__device__ __forceinline__ void cp_async_bulk(half* smem_ptr, const half* global_ptr, bool pred_guard = true)
+__device__ __forceinline__ void cp_async_bulk(half* smem_ptr, const half* global_ptr,
+                                              uint64_t* mbar_ptr, bool pred_guard = true)
 {
     static_assert(SizeInBytes >= 16 && SizeInBytes % 16 == 0,
                   "cp.async.bulk size must be a multiple of 16 bytes");
     unsigned smem_int_ptr = __cvta_generic_to_shared(smem_ptr);
+    unsigned mbar_int_ptr = __cvta_generic_to_shared(mbar_ptr);
     asm volatile("{ \n"
                  "  .reg .pred p;\n"
                  "  setp.ne.b32 p, %0, 0;\n"
-                 "  @p cp.async.bulk.shared::cluster.global [%1], [%2], %3;\n"
+                 "  @p cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+                 " [%1], [%2], %3, [%4];\n"
                  "}\n" ::"r"((int)pred_guard),
                  "r"(smem_int_ptr),
                  "l"(global_ptr),
-                 "n"(SizeInBytes));
+                 "n"(SizeInBytes),
+                 "r"(mbar_int_ptr));
 }
 
 template <int SizeInBytes>
-__device__ __forceinline__ void cp_async_bulk(uint64_t* smem_ptr, const uint64_t* global_ptr, bool pred_guard = true)
+__device__ __forceinline__ void cp_async_bulk(uint64_t* smem_ptr, const uint64_t* global_ptr,
+                                              uint64_t* mbar_ptr, bool pred_guard = true)
 {
     static_assert(SizeInBytes >= 16 && SizeInBytes % 16 == 0,
                   "cp.async.bulk size must be a multiple of 16 bytes");
     unsigned smem_int_ptr = __cvta_generic_to_shared(smem_ptr);
+    unsigned mbar_int_ptr = __cvta_generic_to_shared(mbar_ptr);
     asm volatile("{ \n"
                  "  .reg .pred p;\n"
                  "  setp.ne.b32 p, %0, 0;\n"
-                 "  @p cp.async.bulk.shared::cluster.global [%1], [%2], %3;\n"
+                 "  @p cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes"
+                 " [%1], [%2], %3, [%4];\n"
                  "}\n" ::"r"((int)pred_guard),
                  "r"(smem_int_ptr),
                  "l"(global_ptr),
-                 "n"(SizeInBytes));
+                 "n"(SizeInBytes),
+                 "r"(mbar_int_ptr));
 }
 
 __device__ __forceinline__ void cp_async_bulk_commit_group()
@@ -76,18 +87,21 @@ __device__ __forceinline__ void cp_async_bulk_wait_group()
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ void cp_async_bulk_tensor_2d(
-    half* smem_ptr, const void* tensor_map_ptr, int tile_k, int tile_n)
+    half* smem_ptr, const void* tensor_map_ptr, int tile_k, int tile_n,
+    uint64_t* mbar_ptr)
 {
     unsigned smem_int_ptr = __cvta_generic_to_shared(smem_ptr);
     uint64_t tmap_addr    = __cvta_generic_to_global(tensor_map_ptr);
+    unsigned mbar_int_ptr = __cvta_generic_to_shared(mbar_ptr);
 
     int coords[2] = {tile_k, tile_n};
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+        "cp.async.bulk.tensor.2d.shared::cta.global"
         ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}];\n"
+        " [%0], [%1, {%2, %3}], [%4];\n"
         :
-        : "r"(smem_int_ptr), "l"(tmap_addr), "r"(coords[0]), "r"(coords[1])
+        : "r"(smem_int_ptr), "l"(tmap_addr), "r"(coords[0]), "r"(coords[1]),
+          "r"(mbar_int_ptr)
         : "memory");
 }
 

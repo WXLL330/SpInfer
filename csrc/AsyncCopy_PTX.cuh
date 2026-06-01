@@ -12,6 +12,8 @@
  * limitations under the License.
  ***************************************************************************/
 // Extended from CUTLASS and https://github.com/AlibabaResearch/flash-llm/blob/main/csrc/AsyncCopy_PTX.cuh
+#ifndef ASYNCCOPY_PTX_CUH
+#define ASYNCCOPY_PTX_CUH
 template<int SizeInBytes>
 __device__ __forceinline__ void cp_async(half* smem_ptr, const half* global_ptr, bool pred_guard = true)
 {
@@ -81,3 +83,4 @@ __device__ __forceinline__ void cp_async_wait_group()
 {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
+#endif  // ASYNCCOPY_PTX_CUH

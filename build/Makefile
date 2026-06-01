@@ -35,11 +35,13 @@ LIBRARIES := -lcublas -lcusparse
 ################################################################################
 
 # Gencode arguments
-SMS ?= 89 120
+# SMS ?= 89 120
+SMS ?= 120
 # Generate SASS code for each SM architecture listed in $(SMS)
 $(foreach sm,$(SMS),$(eval GENCODE_FLAGS += -gencode arch=compute_$(sm),code=sm_$(sm)))
 
 ALL_CCFLAGS +=  --threads 0 --std=c++11
+# ALL_CCFLAGS += -g -G	# for debug
 ALL_CCFLAGS += -maxrregcount=255 
 ALL_CCFLAGS += --use_fast_math
 ALL_CCFLAGS += --ptxas-options=-v,-warn-lmem-usage,--warn-on-spills
@@ -51,6 +53,7 @@ HEAD_FILES = SpMM_API.cuh \
 			 ../csrc/MMA_PTX.cuh ../csrc/AsyncCopy_PTX.cuh \
 			 ../csrc/AsyncCopyBulk_PTX.cuh \
 			 ../csrc/MBarrier_PTX.cuh \
+			 ../csrc/SpMM_Kernel_Blackwell.cuh \
 			 ../csrc/TilingConfig.h
 # Target rules
 all: libSpMM_API.so

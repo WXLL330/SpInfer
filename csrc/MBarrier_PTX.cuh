@@ -26,7 +26,8 @@
 
 #include "TilingConfig.h"
 
-#if __CUDA_ARCH__ >= 900
+// #if __CUDA_ARCH__ >= 900
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
 
 /// Initialize an mbarrier in shared memory.
 /// count: expected arrival count per phase cycle.
